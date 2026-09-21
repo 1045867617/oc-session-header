@@ -1,0 +1,11 @@
+{
+    "display_name": "opencode 会话头注入",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "local",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false
+}
