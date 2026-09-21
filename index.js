@@ -4,12 +4,18 @@
  * 作用：把扩展（如柏宝书）发往 ST 后端的 /api/backends/chat-completions/generate
  *      请求改写成 custom 源，并补上 x-opencode-session 请求头。
  *
- * 不依赖任何 import，全部走 window.SillyTavern.getContext()，避免路径问题。
+ * 设计原则：绝不干扰其它 API。
+ *  - 只处理 /api/backends/chat-completions/generate 的 POST
+ *  - 只有请求里的目标地址包含「目标地址包含」字段的值时才改写
+ *  - 该字段为空 = 整体关闭（避免空字符串匹配一切）
+ *  - 总开关可随时关闭
+ *  - 不依赖任何 import，全部走 window.SillyTavern.getContext()
  */
 
 const MODULE = 'oc_session_header';
 
 const DEFAULTS = {
+    enabled: true,
     targetHost: 'opencode.ai',
     sessionId: 'b3d0e2a1-4c6f-4d2e-9a71-0f5c8e2b7d13',
     orgId: '',
@@ -58,7 +64,11 @@ function save() {
 }
 
 function log(...args) {
-    if (getSettings().debug) console.log('[oc-session]', ...args);
+    try {
+        if (getSettings().debug) console.log('[oc-session]', ...args);
+    } catch {
+        /* ignore */
+    }
 }
 
 function parseHeaders(raw) {
@@ -71,9 +81,21 @@ function parseHeaders(raw) {
     }
 }
 
-function patchBody(raw) {
-    const s = getSettings();
+function pickTarget(body) {
+    const t = body.custom_url ?? body.reverse_proxy;
+    return typeof t === 'string' ? t : '';
+}
 
+function shouldRewrite(body) {
+    const s = getSettings();
+    if (!s.enabled) return false;
+    const host = String(s.targetHost ?? '').trim();
+    if (!host) return false;
+    const target = pickTarget(body);
+    return target.length > 0 && target.includes(host);
+}
+
+function patchBody(raw) {
     let body;
     try {
         body = JSON.parse(raw);
@@ -81,16 +103,18 @@ function patchBody(raw) {
         return null;
     }
     if (!body || typeof body !== 'object') return null;
+    if (!shouldRewrite(body)) return null;
 
-    const target = body.custom_url || body.reverse_proxy || '';
-    if (typeof target !== 'string' || !target.includes(s.targetHost)) return null;
-
+    const s = getSettings();
+    const target = pickTarget(body);
     const headers = parseHeaders(body.custom_include_headers);
 
     const hasAuth = Object.keys(headers).some(k => k.toLowerCase() === 'authorization');
-    if (!hasAuth) headers['Authorization'] = `Bearer ${body.proxy_password || ''}`;
+    if (!hasAuth) {
+        headers['Authorization'] = `Bearer ${body.proxy_password || ''}`;
+    }
 
-    headers['x-opencode-session'] = s.sessionId;
+    headers['x-opencode-session'] = s.sessionId || DEFAULTS.sessionId;
     if (s.orgId) headers['x-opencode-org-id'] = s.orgId;
     if (s.userAgent) headers['User-Agent'] = s.userAgent;
 
@@ -100,12 +124,24 @@ function patchBody(raw) {
     delete body.reverse_proxy;
     delete body.proxy_password;
 
-    log('已改写请求 →', headers);
+    log('已改写请求 →', target, headers);
     return JSON.stringify(body);
 }
 
-function makeWrapper(baseFetch) {
-    return async function (input, init) {
+/* ---------------- fetch 拦截（只包裹一层，绝不递归） ---------------- */
+
+let currentWrapped = null;
+
+function installInterceptor() {
+    const base = window.fetch;
+    if (!base) return;
+    if (base === currentWrapped || base.__ocSessionWrapped) {
+        currentWrapped = base;
+        return;
+    }
+
+    const baseBound = base.bind(window);
+    const wrapped = function (input, init) {
         try {
             const url =
                 typeof input === 'string'
@@ -117,30 +153,40 @@ function makeWrapper(baseFetch) {
                 init?.method || (input instanceof Request ? input.method : 'GET'),
             ).toUpperCase();
 
-            if (url.includes(GENERATE_PATH) && method === 'POST' && typeof init?.body === 'string') {
+            if (
+                url.includes(GENERATE_PATH) &&
+                method === 'POST' &&
+                typeof init?.body === 'string'
+            ) {
                 const patched = patchBody(init.body);
                 if (patched) init = { ...init, body: patched };
             }
         } catch (e) {
             console.error('[oc-session] 改写失败，已按原样放行', e);
         }
-        return baseFetch.call(window, input, init);
+        return baseBound(input, init);
     };
+    wrapped.__ocSessionWrapped = true;
+
+    currentWrapped = wrapped;
+    window.fetch = wrapped;
 }
 
-let patchedFetch = makeWrapper(window.fetch.bind(window));
-window.fetch = patchedFetch;
-
-// 宿主可能在启动过程中再次替换 window.fetch，定期确认我们的拦截仍在最外层。
-setInterval(() => {
-    if (window.fetch !== patchedFetch) {
-        patchedFetch = makeWrapper(window.fetch.bind(window));
-        window.fetch = patchedFetch;
-        log('重新挂载 fetch 拦截');
-    }
-}, 2000);
-
+installInterceptor();
 log('fetch 拦截已挂载');
+
+// 宿主在启动阶段可能覆盖 window.fetch，这里做有限的几次确认（不做常驻轮询）。
+for (const delay of [500, 1500, 4000, 10000, 20000]) {
+    setTimeout(() => {
+        try {
+            installInterceptor();
+        } catch {
+            /* ignore */
+        }
+    }, delay);
+}
+
+/* ---------------- 设置界面 ---------------- */
 
 function buildUi() {
     if (!window.jQuery) return false;
@@ -155,7 +201,11 @@ function buildUi() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <label>目标地址包含
+                <label class="checkbox_label">
+                    <input id="oc_enabled" type="checkbox">
+                    <span>启用改写（关闭后本扩展不做任何事）</span>
+                </label>
+                <label>目标地址包含（留空 = 关闭）
                     <input id="oc_target_host" class="text_pole" type="text">
                 </label>
                 <label>x-opencode-session
@@ -171,7 +221,7 @@ function buildUi() {
                     <input id="oc_debug" type="checkbox">
                     <span>控制台输出调试日志</span>
                 </label>
-                <small>保存后立即生效。只影响目标地址匹配的请求。</small>
+                <small>只影响目标地址匹配的请求，其它 API 一律原样放行。</small>
             </div>
         </div>
     </div>`;
@@ -179,6 +229,10 @@ function buildUi() {
     const $ = window.jQuery;
     $('#extensions_settings').append(html);
 
+    $('#oc_enabled').prop('checked', !!s.enabled).on('change', function () {
+        getSettings().enabled = $(this).is(':checked');
+        save();
+    });
     $('#oc_target_host').val(s.targetHost).on('input', function () {
         getSettings().targetHost = String($(this).val());
         save();
@@ -204,7 +258,12 @@ function buildUi() {
 }
 
 (function mountUi(attempt = 0) {
-    if (buildUi()) return;
+    try {
+        if (buildUi()) return;
+    } catch (e) {
+        console.error('[oc-session] 设置面板挂载失败', e);
+        return;
+    }
     if (attempt > 40) return;
     setTimeout(() => mountUi(attempt + 1), 500);
 })();
